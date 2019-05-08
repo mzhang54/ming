@@ -2,6 +2,7 @@
 #define THREADS_THREAD_H
 
 #include <debug.h>
+#include <hash.h>
 #include <list.h>
 #include <stdint.h>
 #include "threads/synch.h"
@@ -117,11 +118,13 @@ struct thread
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
 #endif
+    struct hash *pages;
     struct file *bin_file;              /* Executable. */
 
     /* Owned by syscall.c. */
     struct list fds;                    /* List of file descriptors. */
     int next_handle;                    /* Next handle value. */
+    void *user_esp;
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */

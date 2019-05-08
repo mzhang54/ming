@@ -13,6 +13,7 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "vm/page.h"
  
  
 static int sys_halt (void);
@@ -28,7 +29,9 @@ static int sys_write (int handle, void *usrc_, unsigned size);
 static int sys_seek (int handle, unsigned position);
 static int sys_tell (int handle);
 static int sys_close (int handle);
- 
+// static int sys_mmap (int handle, void *addr);
+// static int sys_munmap (int mapping);
+
 static void syscall_handler (struct intr_frame *);
 static void copy_in (void *, const void *, size_t);
  
@@ -71,6 +74,8 @@ syscall_handler (struct intr_frame *f)
       {2, (syscall_function *) sys_seek},
       {1, (syscall_function *) sys_tell},
       {1, (syscall_function *) sys_close},
+      // {2, (syscall_function *) sys_mmap},
+      // {1, (syscall_function *) sys_munmap},
     };
 
   const struct syscall *sc;
@@ -135,9 +140,21 @@ copy_in (void *dst_, const void *usrc_, size_t size)
   uint8_t *dst = dst_;
   const uint8_t *usrc = usrc_;
  
-  for (; size > 0; size--, dst++, usrc++) 
-    if (usrc >= (uint8_t *) PHYS_BASE || !get_user (dst, usrc)) 
-      thread_exit ();
+  while (size > 0) 
+    {
+      size_t chunk_size = PGSIZE - pg_ofs (usrc);
+      if (chunk_size > size)
+        chunk_size = size;
+      
+      if (!page_lock (usrc, false))
+        thread_exit ();
+      memcpy (dst, usrc, chunk_size);
+      page_unlock (usrc);
+
+      dst += chunk_size;
+      usrc += chunk_size;
+      size -= chunk_size;
+    }
 }
  
 /* Creates a copy of user string US in kernel memory
@@ -150,24 +167,42 @@ copy_in_string (const char *us)
 {
   char *ks;
   size_t length;
- 
+  char *upage;
+
   ks = palloc_get_page (0);
   if (ks == NULL) 
     thread_exit ();
- 
-  for (length = 0; length < PGSIZE; length++)
+
+  length = 0;
+  for (;;) 
     {
-      if (us >= (char *) PHYS_BASE || !get_user (ks + length, us++)) 
+      upage = pg_round_down (us);
+      if (!page_lock (upage, false))
+        goto lock_error;
+
+      for (; us < upage + PGSIZE; us++) 
         {
-          palloc_free_page (ks);
-          thread_exit (); 
+          ks[length++] = *us;
+          if (*us == '\0') 
+            {
+              page_unlock (upage);
+              return ks; 
+            }
+          else if (length >= PGSIZE)
+            {
+              length = 0;
+              break;
+            } 
+            // goto too_long_error;
         }
-       
-      if (ks[length] == '\0')
-        return ks;
+      page_unlock (upage);
     }
-  ks[PGSIZE - 1] = '\0';
-  return ks;
+
+//  too_long_error:
+//   page_unlock (upage);
+ lock_error:
+  palloc_free_page (ks);
+  thread_exit ();
 }
  
 /* Halt system call. */
@@ -320,18 +355,7 @@ sys_read (int handle, void *udst_, unsigned size)
   struct file_descriptor *fd;
   int bytes_read = 0;
 
-  /* Handle keyboard reads. */
-  if (handle == STDIN_FILENO) 
-    {
-      for (bytes_read = 0; (size_t) bytes_read < size; bytes_read++)
-        if (udst >= (uint8_t *) PHYS_BASE || !put_user (udst++, input_getc ()))
-          thread_exit ();
-      return bytes_read;
-    }
-
-  /* Handle all other reads. */
   fd = lookup_fd (handle);
-  lock_acquire (&fs_lock);
   while (size > 0) 
     {
       /* How much to read into this page? */
@@ -339,32 +363,49 @@ sys_read (int handle, void *udst_, unsigned size)
       size_t read_amt = size < page_left ? size : page_left;
       off_t retval;
 
-      /* Check that touching this page is okay. */
-      if (!verify_user (udst)) 
-        {
-          lock_release (&fs_lock);
-          thread_exit ();
-        }
-
       /* Read from file into page. */
-      retval = file_read (fd->file, udst, read_amt);
+      if (handle != STDIN_FILENO) 
+        {
+          if (!page_lock (udst, true)) 
+            thread_exit (); 
+          lock_acquire (&fs_lock);
+          retval = file_read (fd->file, udst, read_amt);
+          lock_release (&fs_lock);
+          page_unlock (udst);
+        }
+      else 
+        {
+          size_t i;
+          
+          for (i = 0; i < read_amt; i++) 
+            {
+              char c = input_getc ();
+              if (!page_lock (udst, true)) 
+                thread_exit ();
+              udst[i] = c;
+              page_unlock (udst);
+            }
+          bytes_read = read_amt;
+        }
+      
+      /* Check success. */
       if (retval < 0)
         {
           if (bytes_read == 0)
             bytes_read = -1; 
           break;
         }
-      bytes_read += retval;
-
-      /* If it was a short read we're done. */
-      if (retval != (off_t) read_amt)
-        break;
+      bytes_read += retval; 
+      if (retval != (off_t) read_amt) 
+        {
+          /* Short read, so we're done. */
+          break; 
+        }
 
       /* Advance. */
       udst += retval;
       size -= retval;
     }
-  lock_release (&fs_lock);
    
   return bytes_read;
 }
@@ -381,7 +422,6 @@ sys_write (int handle, void *usrc_, unsigned size)
   if (handle != STDOUT_FILENO)
     fd = lookup_fd (handle);
 
-  lock_acquire (&fs_lock);
   while (size > 0) 
     {
       /* How much bytes to write to this page? */
@@ -389,21 +429,21 @@ sys_write (int handle, void *usrc_, unsigned size)
       size_t write_amt = size < page_left ? size : page_left;
       off_t retval;
 
-      /* Check that we can touch this user page. */
-      if (!verify_user (usrc)) 
-        {
-          lock_release (&fs_lock);
-          thread_exit ();
-        }
-
-      /* Do the write. */
+      /* Write from page into file. */
+      if (!page_lock (usrc, false)) 
+        thread_exit ();
+      lock_acquire (&fs_lock);
       if (handle == STDOUT_FILENO)
         {
-          putbuf (usrc, write_amt);
+          putbuf ((char *) usrc, write_amt);
           retval = write_amt;
         }
       else
         retval = file_write (fd->file, usrc, write_amt);
+      lock_release (&fs_lock);
+      page_unlock (usrc);
+
+      /* Handle return value. */
       if (retval < 0) 
         {
           if (bytes_written == 0)
@@ -420,7 +460,6 @@ sys_write (int handle, void *usrc_, unsigned size)
       usrc += retval;
       size -= retval;
     }
-  lock_release (&fs_lock);
  
   return bytes_written;
 }
@@ -466,6 +505,7 @@ sys_close (int handle)
   return 0;
 }
  
+
 /* On thread exit, close all open files. */
 void
 syscall_exit (void) 
@@ -483,4 +523,6 @@ syscall_exit (void)
       lock_release (&fs_lock);
       free (fd);
     }
+
+
 }
